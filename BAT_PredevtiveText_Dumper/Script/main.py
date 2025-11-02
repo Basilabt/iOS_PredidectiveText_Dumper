@@ -2,155 +2,124 @@
 import os
 import io
 import sys
-import time
 import fnmatch
+import stat
+import base64
+import binascii
+import sqlite3
 import plistlib
 import paramiko
 from getpass import getpass
-from art import tprint
-from tabulate import tabulate
 from datetime import datetime
+from art import tprint
 
-# ----------------------------------------------------
 tprint("BAT PredictiveText Dumper")
 print("by @Basel AbuTaleb\n\n")
 
-# ----------------------------------------------------
 host = input("[+] Enter device IP or hostname: ")
 port = int(input("[+] Enter SSH port (default 22): ") or 22)
 username = input("[+] Enter SSH username: ")
 password = getpass("[+] Enter SSH password: ")
 
-REMOTE_KEYBOARD_DIR = "/var/mobile/Library/Keyboard"
+REMOTE_BASE = "/private/var/mobile/Library/Keyboard"
+DIRS_TO_GET = ["en-dynamic.lm", "ar-dynamic.lm"]
+DBS = ["user_model_database.sqlite", "langlikelihood.dat"]
 
-CANDIDATE_PATTERNS = [
-    "UserDictionary.sqlite*",
-    "*-dynamic-text.dat",
-    "dynamic-*.dat",
-    "*dynamic*.dat",
-    "*.lexicon",
-    "*Lexicon*.plist",
-    "*.lm",
-    "*.dat"
-]
+def quote(p):
+    return "'" + p.replace("'", "'\"'\"'") + "'"
 
-# ----------------------------------------------------
-def human_size(n):
-    for unit in ["B","KB","MB","GB","TB"]:
-        if n < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PB"
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
-def match_any(name, patterns):
-    return any(fnmatch.fnmatch(name, p) for p in patterns)
+def s_isdir(sftp, path):
+    st = sftp.lstat(path)
+    return stat.S_ISDIR(st.st_mode)
 
-def safe_join(dirpath, name):
-    if dirpath.endswith("/"):
-        return dirpath + name
-    return dirpath + "/" + name
+def s_list(sftp, path):
+    for e in sftp.listdir_attr(path):
+        yield e.filename
 
-# ----------------------------------------------------
+def s_download_file_sftp_or_stream(ssh, sftp, rpath, lpath):
+    try:
+        sftp.get(rpath, lpath)
+        return True
+    except Exception:
+        try:
+            cmd = f"base64 -w 0 {quote(rpath)}"
+            _, out, err = ssh.exec_command(cmd)
+            b64 = out.read()
+            if not b64:
+                return False
+            data = base64.b64decode(b64)
+            with open(lpath, "wb") as f:
+                f.write(data)
+            return True
+        except Exception:
+            return False
+
+def s_download_dir(ssh, sftp, rdir, ldir):
+    ensure_dir(ldir)
+    for name in s_list(sftp, rdir):
+        rpath = f"{rdir.rstrip('/')}/{name}"
+        lpath = os.path.join(ldir, name)
+        if s_isdir(sftp, rpath):
+            s_download_dir(ssh, sftp, rpath, lpath)
+        else:
+            s_download_file_sftp_or_stream(ssh, sftp, rpath, lpath)
+
+def merge_and_dump_sqlite(db_path):
+    try:
+        wal = db_path + "-wal" if db_path.endswith(".sqlite") else db_path + "-wal"
+        shm = db_path + "-shm" if db_path.endswith(".sqlite") else db_path + "-shm"
+        base = os.path.basename(db_path)
+        root, ext = os.path.splitext(base)
+        out_db = os.path.join(os.path.dirname(db_path), f"{root}_full.db")
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        b = sqlite3.connect(out_db)
+        con.backup(b)
+        b.commit(); b.close(); con.close()
+        dump_sql = os.path.join(os.path.dirname(db_path), f"{root}_dump.sql")
+        c = sqlite3.connect(out_db)
+        with open(dump_sql, "w", encoding="utf-8") as f:
+            for line in c.iterdump():
+                f.write(f"{line}\n")
+        c.close()
+    except Exception:
+        pass
+
 try:
-    print("[*] Connecting via SSH...")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(host, port=port, username=username, password=password)
-
+    ssh.connect(host, port=port, username=username, password=password, timeout=20)
     sftp = ssh.open_sftp()
-
-    try:
-        sftp.chdir(REMOTE_KEYBOARD_DIR)
-    except IOError:
-        raise RuntimeError(f"Remote path not found: {REMOTE_KEYBOARD_DIR}")
-
-    print(f"[*] Scanning {REMOTE_KEYBOARD_DIR} ...")
-    entries = sftp.listdir_attr(".")
-    files = [e for e in entries if not str(e).startswith("d")]
-
-    candidates = []
-    for e in entries:
-        name = getattr(e, "filename", None) or str(e)
-        if name in [".",".."]:
-            continue
-        if match_any(name, CANDIDATE_PATTERNS):
-            size = getattr(e, "st_size", 0)
-            mtime = getattr(e, "st_mtime", 0)
-            candidates.append({
-                "name": name,
-                "size": size,
-                "mtime": mtime
-            })
-
-    if not candidates:
-        print("[!] No predictive-text / keyboard candidate files found by pattern.")
-        sftp.close()
-        ssh.close()
-        sys.exit(0)
-
-    table_data = []
-    for idx, c in enumerate(sorted(candidates, key=lambda x: x["mtime"], reverse=True), 1):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(c["mtime"])) if c["mtime"] else "-"
-        table_data.append([idx, c["name"], human_size(c["size"]), ts])
-    print("\n--- Predictive Text / Keyboard Files ---")
-    print(tabulate(table_data, headers=["#", "Filename", "Size", "Modified (device time)"], tablefmt="grid", stralign="left"))
-
-    choice = input("\n[?] Download (A)ll or select by numbers (e.g., 1,3,5): ").strip()
-    if choice.lower().startswith("a"):
-        to_download = sorted(candidates, key=lambda x: x["mtime"], reverse=True)
-    else:
-        indexes = []
-        if choice:
-            for part in choice.split(","):
-                part = part.strip()
-                if part.isdigit():
-                    indexes.append(int(part))
-        picked = []
-        sorted_list = sorted(candidates, key=lambda x: x["mtime"], reverse=True)
-        for i in indexes:
-            if 1 <= i <= len(sorted_list):
-                picked.append(sorted_list[i-1])
-        if not picked:
-            print("[!] No valid selection. Exiting.")
-            sftp.close()
-            ssh.close()
-            sys.exit(0)
-        to_download = picked
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(os.getcwd(), f"predictive_text_dump_{stamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"[*] Saving files to: {out_dir}")
+    ensure_dir(out_dir)
 
-    for c in to_download:
-        remote_path = safe_join(REMOTE_KEYBOARD_DIR, c["name"])
-        local_path = os.path.join(out_dir, c["name"])
+    for d in DIRS_TO_GET:
+        rdir = f"{REMOTE_BASE}/{d}"
         try:
-            print(f"[+] Downloading: {c['name']}")
-            sftp.get(remote_path, local_path)
-        except Exception as ex:
-            print(f"[!] Failed to download {c['name']}: {ex}")
+            if s_isdir(sftp, rdir):
+                s_download_dir(ssh, sftp, rdir, os.path.join(out_dir, d))
+        except Exception:
+            pass
 
-    plist_rows = []
-    for c in to_download:
-        if c["name"].lower().endswith(".plist"):
-            local_path = os.path.join(out_dir, c["name"])
-            try:
-                with open(local_path, "rb") as f:
-                    data = plistlib.load(io.BytesIO(f.read()))
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        plist_rows.append([c["name"], str(k), str(v)])
-            except Exception:
-                pass
+    for db in DBS:
+        rfile = f"{REMOTE_BASE}/{db}"
+        lfile = os.path.join(out_dir, db)
+        s_download_file_sftp_or_stream(ssh, sftp, rfile, lfile)
+        for suf in ("-wal", "-shm"):
+            s_download_file_sftp_or_stream(ssh, sftp, rfile + suf, lfile + suf)
+        merge_and_dump_sqlite(lfile)
 
-    if plist_rows:
-        print("\n--- Preview of downloaded *.plist contents (top-level keys) ---")
-        print(tabulate(plist_rows, headers=["Plist", "Key", "Value"], tablefmt="grid", stralign="left"))
-
-    sftp.close()
-    ssh.close()
-    print("\n[*] Done.")
-
-except Exception as e:
-    print(f"Error: {e}")
+    try: sftp.close()
+    except Exception: pass
+    try: ssh.close()
+    except Exception: pass
+except Exception:
+    try: sftp.close()
+    except Exception: pass
+    try: ssh.close()
+    except Exception: pass
+    sys.exit(1)
