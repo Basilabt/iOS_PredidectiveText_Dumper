@@ -15,7 +15,7 @@
 - [Contact](#contact)
 
 ## Preview
-<img width="1566" height="741" alt="Image" src="https://github.com/user-attachments/assets/88d215df-c6e6-4975-bb32-5ae3c29ab712" />
+<img width="1364" height="645" alt="Image" src="https://github.com/user-attachments/assets/52578ed8-64a1-4d00-9a7f-702e331bb82f" />
 
 ## Requirements
 - Linux or macOS environment  
@@ -39,12 +39,9 @@ All downloaded files are saved into a timestamped folder for easy organization.
 
 ```
 # 1. Clone the repository
-  > git clone https://github.com/Basilabt/iOS_PredictiveText_Dumper
+  > git clone https://github.com/Basilabt/iOS_PredidectiveText_Dumper/tree/main/BAT_PredevtiveText_Dumper
 
-# 2. Navigate to the project directory
-  > cd iOS_PredictiveText_Dumper/Script
-
-# 3. Run the tool
+ 2. Run the tool
   > python3 main.py
 ```
 
